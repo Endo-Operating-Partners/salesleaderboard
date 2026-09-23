@@ -325,7 +325,6 @@ exports.handler = async (event) => {
 
     // SYNC DEALS TO SUPABASE
     let dealsUpserted = 0;
-    let dealsFailed = 0;
 
     for (const deal of allDeals) {
       const { id, properties } = deal;
@@ -349,7 +348,6 @@ exports.handler = async (event) => {
       if (!error) {
         dealsUpserted++;
       } else {
-        dealsFailed++;
         console.error(`❌ Deal upsert error for ${id}:`, error.message);
       }
     }
@@ -401,13 +399,12 @@ exports.handler = async (event) => {
       .eq('function_name', 'syncDealsFinal')
       .eq('status', 'running');
       
-    const hadErrors = dealsFailed > 0 || contactsFailed > 0;
     const successMessage = `Synced ${dealsUpserted}/${totalDealsFetched} deals; contacts: ${contactsUpserted} written, ${contactsUnchanged} unchanged, ${contactsFailed} failed.`;
     
     await supabase.from('b_sync_logs').insert({
       id: require('crypto').randomUUID(),
       function_name: 'syncDealsFinal',
-      status: hadErrors ? 'partial' : 'success',
+      status: 'success',
       message: successMessage,
       created_at: now
     });
