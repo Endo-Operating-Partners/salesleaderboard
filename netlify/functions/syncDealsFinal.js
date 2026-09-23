@@ -3,6 +3,7 @@ const { createClient } = require('@supabase/supabase-js');
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
 const timezone = require('dayjs/plugin/timezone');
+const { contactSourceChanged, loadExistingContacts } = require('../../lib/contactSync.cjs');
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -15,13 +16,34 @@ const supabase = createClient(
 exports.handler = async (event) => {
   try {
     // Add execution protection to prevent overlapping runs
-    const { data: runningSync } = await supabase
+    const { data: runningSync, error: runningError } = await supabase
       .from('b_sync_logs')
       .select('created_at')
       .eq('function_name', 'syncDealsFinal')
       .eq('status', 'running')
       .gte('created_at', dayjs().subtract(5, 'minutes').toISOString())
-      .single();
+      .maybeSingle();
+    if (runningError) {
+      console.error('Contact sync guard unavailable:', runningError.code || 'database_error');
+      return { statusCode: 200, body: JSON.stringify({ skipped: true, reason: 'database_unavailable' }) };
+    }
+
+    const { data: recentPause, error: pauseError } = await supabase
+      .from('b_sync_logs')
+      .select('created_at')
+      .eq('function_name', 'syncDealsFinal')
+      .eq('status', 'paused')
+      .gte('created_at', dayjs().subtract(10, 'minutes').toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (pauseError) {
+      console.error('Contact sync pause check unavailable:', pauseError.code || 'database_error');
+      return { statusCode: 200, body: JSON.stringify({ skipped: true, reason: 'database_unavailable' }) };
+    }
+    if (recentPause) {
+      return { statusCode: 200, body: JSON.stringify({ skipped: true, reason: 'database_pressure' }) };
+    }
     
     if (runningSync) {
       console.log('⏸️ Sync already running, skipping this execution');
@@ -29,13 +51,17 @@ exports.handler = async (event) => {
     }
     
     // Mark this sync as running
-    await supabase.from('b_sync_logs').insert({
+    const { error: startLogError } = await supabase.from('b_sync_logs').insert({
       id: require('crypto').randomUUID(),
       function_name: 'syncDealsFinal',
       status: 'running',
       message: 'Sync started',
       created_at: new Date().toISOString()
     });
+    if (startLogError) {
+      console.error('Contact sync start log unavailable:', startLogError.code || 'database_error');
+      return { statusCode: 200, body: JSON.stringify({ skipped: true, reason: 'database_unavailable' }) };
+    }
     // --- THIS IS THE LINE THAT WAS CHANGED ---
     const isoStart = dayjs().tz('America/Chicago').startOf('month').toISOString();
     
@@ -43,21 +69,23 @@ exports.handler = async (event) => {
     // For ongoing sync: only fetch contacts modified in last 24 hours
     
     // Check contact count to determine if we need full resync
-    const { data: contactCount } = await supabase
+    const { count: contactCount, error: countError } = await supabase
       .from('b_contacts')
-      .select('count(*)', { count: 'exact' });
+      .select('hubspot_id', { count: 'exact', head: true });
+    if (countError) throw new Error(`Contact count failed: ${countError.code || 'database_error'}`);
     
     // Force initial load if we have suspiciously few contacts (like 300)
-    const forceInitialLoad = (contactCount?.[0]?.count || 0) < 1000;
+    const forceInitialLoad = contactCount < 1000;
     
-    const { data: lastSync } = await supabase
+    const { data: lastSync, error: lastSyncError } = await supabase
       .from('b_sync_logs')
       .select('created_at')
       .eq('function_name', 'syncDealsFinal')
       .eq('status', 'success')
       .order('created_at', { ascending: false })
       .limit(1)
-      .single();
+      .maybeSingle();
+    if (lastSyncError) throw new Error(`Last sync lookup failed: ${lastSyncError.code || 'database_error'}`);
     
     const isInitialLoad = !lastSync || forceInitialLoad;
     const contactsStartDate = isInitialLoad 
@@ -326,7 +354,11 @@ exports.handler = async (event) => {
 
     // SYNC CONTACTS TO SUPABASE
     let contactsUpserted = 0;
-    for (const contact of allContacts) {
+    let contactsUnchanged = 0;
+    let contactsFailed = 0;
+    const uniqueContacts = [...new Map(allContacts.map((contact) => [String(contact.id), contact])).values()];
+    const existingContacts = await loadExistingContacts(supabase, uniqueContacts);
+    for (const contact of uniqueContacts) {
       const { id, properties } = contact;
 
       const contactRecord = {
@@ -344,6 +376,11 @@ exports.handler = async (event) => {
         last_synced_at: now
       };
 
+      if (!contactSourceChanged(existingContacts.get(String(id)), contactRecord)) {
+        contactsUnchanged++;
+        continue;
+      }
+
       const { error } = await supabase
         .from('contacts')
         .upsert(contactRecord, { onConflict: 'hubspot_id' });
@@ -351,6 +388,7 @@ exports.handler = async (event) => {
       if (!error) {
         contactsUpserted++;
       } else {
+        contactsFailed++;
         console.error(`❌ Contact upsert error for ${id}:`, error.message);
       }
     }
@@ -361,7 +399,7 @@ exports.handler = async (event) => {
       .eq('function_name', 'syncDealsFinal')
       .eq('status', 'running');
       
-    const successMessage = `✅ Synced ${dealsUpserted}/${totalDealsFetched} deals and ${contactsUpserted}/${totalContactsFetched} contacts to Supabase.`;
+    const successMessage = `Synced ${dealsUpserted}/${totalDealsFetched} deals; contacts: ${contactsUpserted} written, ${contactsUnchanged} unchanged, ${contactsFailed} failed.`;
     
     await supabase.from('b_sync_logs').insert({
       id: require('crypto').randomUUID(),
@@ -378,6 +416,8 @@ exports.handler = async (event) => {
         timestamp: now,
         deals_synced: dealsUpserted,
         contacts_synced: contactsUpserted,
+        contacts_unchanged: contactsUnchanged,
+        contacts_failed: contactsFailed,
         sync_mode: isInitialLoad ? 'initial' : 'incremental'
       })
     };
